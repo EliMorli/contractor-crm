@@ -39,16 +39,97 @@ const ContractorCRM = () => {
 
   const currentProject = projects.find(p => p.id === selectedProject);
 
-  // Calculate totals for a category
-  const getCategoryTotals = (category) => {
-    const clientPaid = category.allocations?.reduce((sum, a) => sum + a.amount, 0) || 0;
-    const youPaid = category.expenses?.reduce((sum, e) => sum + e.amount, 0) || 0;
-    const remaining = category.clientBudget - clientPaid;
-    const yourRemaining = category.yourCost - youPaid;
-    const profit = clientPaid - youPaid;
-    const projectedProfit = category.clientBudget - category.yourCost;
+  // Warning level calculation
+  const getWarningLevel = (buffer, remainingToPay) => {
+    if (remainingToPay <= 0) return 'green'; // All paid, no risk
+    const threshold = remainingToPay * 0.20;
+    if (buffer < 0) return 'red';      // SHORTFALL
+    if (buffer <= threshold) return 'yellow';  // Low buffer
+    return 'green';  // Healthy buffer
+  };
 
-    return { clientPaid, youPaid, remaining, yourRemaining, profit, projectedProfit };
+  // Calculate totals for a category (supports both modes)
+  const getCategoryTotals = (category) => {
+    const mode = category.mode || 'all-inclusive';
+
+    if (mode === 'separate') {
+      // Separate mode: Labor + Materials
+      const laborCollected = category.allocations?.reduce((sum, a) => sum + (a.laborAmount || 0), 0) || 0;
+      const materialsCollected = category.allocations?.reduce((sum, a) => sum + (a.materialsAmount || 0), 0) || 0;
+      const laborPaid = category.expenses?.filter(e => e.type === 'labor').reduce((sum, e) => sum + e.amount, 0) || 0;
+      const materialsPaid = category.expenses?.filter(e => e.type === 'materials').reduce((sum, e) => sum + e.amount, 0) || 0;
+
+      const laborBudget = category.laborBudget || 0;
+      const laborCost = category.laborCost || 0;
+      const materialsBudget = category.materialsBudget || 0;
+
+      const laborRemainingToCollect = laborBudget - laborCollected;
+      const laborRemainingToPay = laborCost - laborPaid;
+      const laborBuffer = laborRemainingToCollect - laborRemainingToPay;
+
+      const materialsRemainingToCollect = materialsBudget - materialsCollected;
+      const materialsRemainingToPay = materialsBudget - materialsPaid; // Materials: budget = cost (pass-through)
+
+      return {
+        mode: 'separate',
+        // Labor metrics
+        laborCollected,
+        laborPaid,
+        laborRemainingToCollect,
+        laborRemainingToPay,
+        laborBuffer,
+        laborWarningLevel: getWarningLevel(laborBuffer, laborRemainingToPay),
+        laborProfit: laborBudget - laborCost, // Projected profit from labor
+        // Materials metrics (pass-through, no profit margin)
+        materialsCollected,
+        materialsPaid,
+        materialsRemainingToCollect,
+        materialsRemainingToPay,
+        // Combined totals for project-level calculations
+        totalCollected: laborCollected + materialsCollected,
+        totalPaid: laborPaid + materialsPaid,
+        totalBudget: laborBudget + materialsBudget,
+        totalCost: laborCost + materialsBudget, // Materials are pass-through
+        projectedProfit: laborBudget - laborCost, // Only labor has margin
+        currentProfit: (laborCollected + materialsCollected) - (laborPaid + materialsPaid)
+      };
+    } else {
+      // All-inclusive mode (default, also handles migrated data)
+      const budget = category.totalBudget ?? category.clientBudget ?? 0;
+      const cost = category.totalCost ?? category.yourCost ?? 0;
+
+      const collected = category.allocations?.reduce((sum, a) => sum + (a.amount || 0), 0) || 0;
+      const paid = category.expenses?.reduce((sum, e) => sum + e.amount, 0) || 0;
+
+      const remainingToCollect = budget - collected;
+      const remainingToPay = cost - paid;
+      const buffer = remainingToCollect - remainingToPay;
+
+      return {
+        mode: 'all-inclusive',
+        budget,
+        cost,
+        collected,
+        paid,
+        remainingToCollect,
+        remainingToPay,
+        buffer,
+        warningLevel: getWarningLevel(buffer, remainingToPay),
+        projectedProfit: budget - cost,
+        currentMargin: collected - paid,
+        // For backward compatibility with old code
+        clientPaid: collected,
+        youPaid: paid,
+        remaining: remainingToCollect,
+        yourRemaining: remainingToPay,
+        profit: collected - paid,
+        // For project totals
+        totalCollected: collected,
+        totalPaid: paid,
+        totalBudget: budget,
+        totalCost: cost
+      };
+    }
   };
 
   // Add new project
@@ -68,16 +149,29 @@ const ContractorCRM = () => {
     setShowNewProject(false);
   };
 
-  // Add category to project
-  const addCategory = async (name, clientBudget, yourCost) => {
+  // Add category to project (supports both modes)
+  const addCategory = async (categoryData) => {
     const newCategory = {
       id: Date.now(),
-      name,
-      clientBudget: parseFloat(clientBudget),
-      yourCost: parseFloat(yourCost),
+      name: categoryData.name,
+      mode: categoryData.mode,
       allocations: [],
       expenses: []
     };
+
+    if (categoryData.mode === 'separate') {
+      newCategory.laborBudget = parseFloat(categoryData.laborBudget) || 0;
+      newCategory.laborCost = parseFloat(categoryData.laborCost) || 0;
+      newCategory.materialsBudget = parseFloat(categoryData.materialsBudget) || 0;
+      newCategory.totalBudget = null;
+      newCategory.totalCost = null;
+    } else {
+      newCategory.totalBudget = parseFloat(categoryData.totalBudget) || 0;
+      newCategory.totalCost = parseFloat(categoryData.totalCost) || 0;
+      newCategory.laborBudget = null;
+      newCategory.laborCost = null;
+      newCategory.materialsBudget = null;
+    }
 
     await db.saveCategory(selectedProject, newCategory);
 
@@ -93,31 +187,42 @@ const ContractorCRM = () => {
     setShowNewCategory(false);
   };
 
-  // Add payment from client
-  const addPayment = async (checkNumber, totalAmount, allocations, date, notes) => {
+  // Add payment from client (supports both allocation types)
+  const addPayment = async (paymentData) => {
     const paymentId = Date.now();
     const newPayment = {
       id: paymentId,
-      checkNumber,
-      totalAmount: parseFloat(totalAmount),
-      allocations: allocations.filter(a => a.amount > 0),
-      date,
-      notes
+      paymentMethod: paymentData.paymentMethod,
+      reference: paymentData.reference,
+      totalAmount: parseFloat(paymentData.totalAmount),
+      allocations: paymentData.allocations.filter(a =>
+        (a.amount > 0) || (a.laborAmount > 0) || (a.materialsAmount > 0)
+      ),
+      date: paymentData.date,
+      notes: paymentData.notes
     };
 
-    await db.savePayment(selectedProject, newPayment, allocations);
+    await db.savePayment(selectedProject, newPayment, paymentData.allocations);
 
     setProjects(projects.map(p => {
       if (p.id === selectedProject) {
         const newCategories = p.categories.map(cat => {
-          const allocation = allocations.find(a => a.categoryId === cat.id);
-          if (allocation && allocation.amount > 0) {
+          const allocation = paymentData.allocations.find(a => a.categoryId === cat.id);
+          if (!allocation) return cat;
+
+          const hasAllocation = (allocation.amount > 0) ||
+                               (allocation.laborAmount > 0) ||
+                               (allocation.materialsAmount > 0);
+
+          if (hasAllocation) {
             return {
               ...cat,
               allocations: [...cat.allocations, {
                 paymentId,
-                amount: parseFloat(allocation.amount),
-                date
+                amount: parseFloat(allocation.amount) || null,
+                laborAmount: parseFloat(allocation.laborAmount) || null,
+                materialsAmount: parseFloat(allocation.materialsAmount) || null,
+                date: paymentData.date
               }]
             };
           }
@@ -135,23 +240,26 @@ const ContractorCRM = () => {
     setShowNewPayment(false);
   };
 
-  // Add expense (payment to sub)
-  const addExpense = async (categoryId, amount, date, description) => {
+  // Add expense (payment to sub) - supports typed expenses for separate mode
+  const addExpense = async (expenseData) => {
     const newExpense = {
       id: Date.now(),
-      amount: parseFloat(amount),
-      date,
-      description
+      amount: parseFloat(expenseData.amount),
+      date: expenseData.date,
+      description: expenseData.description,
+      type: expenseData.type || null,
+      paymentMethod: expenseData.paymentMethod || null,
+      reference: expenseData.reference || null
     };
 
-    await db.saveExpense(categoryId, newExpense);
+    await db.saveExpense(expenseData.categoryId, newExpense);
 
     setProjects(projects.map(p => {
       if (p.id === selectedProject) {
         return {
           ...p,
           categories: p.categories.map(cat => {
-            if (cat.id === categoryId) {
+            if (cat.id === expenseData.categoryId) {
               return {
                 ...cat,
                 expenses: [...cat.expenses, newExpense]
@@ -249,19 +357,46 @@ const ContractorCRM = () => {
     });
   };
 
-  // Project totals
+  // Project totals (handles both category modes)
   const getProjectTotals = () => {
-    if (!currentProject) return { totalBudget: 0, totalCost: 0, totalPaid: 0, totalSpent: 0 };
+    if (!currentProject) return {
+      totalBudget: 0, totalCost: 0, totalPaid: 0, totalSpent: 0,
+      categoryHealth: { green: 0, yellow: 0, red: 0 }
+    };
 
-    return currentProject.categories.reduce((acc, cat) => {
+    let totalBudget = 0;
+    let totalCost = 0;
+    let totalPaid = 0;
+    let totalSpent = 0;
+    let greenCount = 0;
+    let yellowCount = 0;
+    let redCount = 0;
+
+    currentProject.categories.forEach(cat => {
       const totals = getCategoryTotals(cat);
-      return {
-        totalBudget: acc.totalBudget + cat.clientBudget,
-        totalCost: acc.totalCost + cat.yourCost,
-        totalPaid: acc.totalPaid + totals.clientPaid,
-        totalSpent: acc.totalSpent + totals.youPaid
-      };
-    }, { totalBudget: 0, totalCost: 0, totalPaid: 0, totalSpent: 0 });
+
+      totalBudget += totals.totalBudget || 0;
+      totalCost += totals.totalCost || 0;
+      totalPaid += totals.totalCollected || 0;
+      totalSpent += totals.totalPaid || 0;
+
+      // Count warning levels
+      const warningLevel = totals.mode === 'separate'
+        ? totals.laborWarningLevel
+        : totals.warningLevel;
+
+      if (warningLevel === 'red') redCount++;
+      else if (warningLevel === 'yellow') yellowCount++;
+      else greenCount++;
+    });
+
+    return {
+      totalBudget,
+      totalCost,
+      totalPaid,
+      totalSpent,
+      categoryHealth: { green: greenCount, yellow: yellowCount, red: redCount }
+    };
   };
 
   if (isLoading) {
@@ -334,6 +469,8 @@ const ContractorCRM = () => {
                 const totals = getProjectTotals();
                 const projectedProfit = totals.totalBudget - totals.totalCost;
                 const currentProfit = totals.totalPaid - totals.totalSpent;
+                const health = totals.categoryHealth;
+                const totalCategories = health.green + health.yellow + health.red;
                 return (
                   <>
                     <div style={styles.summaryCard}>
@@ -363,6 +500,32 @@ const ContractorCRM = () => {
                       </div>
                       <div style={styles.summarySubtext}>
                         Current: {formatCurrency(currentProfit)}
+                      </div>
+                    </div>
+                    <div style={{
+                      ...styles.summaryCard,
+                      borderColor: health.red > 0 ? '#b91c1c' : health.yellow > 0 ? '#a16207' : '#166534'
+                    }}>
+                      <div style={styles.summaryLabel}>Category Health</div>
+                      <div style={styles.healthIndicators}>
+                        {health.red > 0 && (
+                          <span style={styles.healthBadgeRed}>
+                            {health.red} Alert{health.red > 1 ? 's' : ''}
+                          </span>
+                        )}
+                        {health.yellow > 0 && (
+                          <span style={styles.healthBadgeYellow}>
+                            {health.yellow} Caution
+                          </span>
+                        )}
+                        {health.green > 0 && (
+                          <span style={styles.healthBadgeGreen}>
+                            {health.green} Healthy
+                          </span>
+                        )}
+                      </div>
+                      <div style={styles.summarySubtext}>
+                        {totalCategories} categor{totalCategories === 1 ? 'y' : 'ies'} total
                       </div>
                     </div>
                   </>
@@ -405,100 +568,271 @@ const ContractorCRM = () => {
                     <div style={styles.categoryGrid}>
                       {currentProject.categories.map(category => {
                         const totals = getCategoryTotals(category);
-                        const clientProgress = (totals.clientPaid / category.clientBudget) * 100;
-                        const yourProgress = (totals.youPaid / category.yourCost) * 100;
-                        const isOverCollected = totals.clientPaid > category.clientBudget;
-                        const isUnderwater = totals.youPaid > totals.clientPaid;
+                        const mode = category.mode || 'all-inclusive';
 
-                        return (
-                          <div key={category.id} style={styles.categoryCard}>
-                            <div style={styles.categoryHeader}>
-                              <h3 style={styles.categoryName}>{category.name}</h3>
-                              <button
-                                style={styles.deleteBtn}
-                                onClick={() => deleteCategory(category.id)}
-                              >
-                                ×
-                              </button>
-                            </div>
+                        // Warning indicator colors
+                        const warningColors = {
+                          green: { bg: '#052e16', border: '#166534', dot: '#22c55e' },
+                          yellow: { bg: '#422006', border: '#a16207', dot: '#eab308' },
+                          red: { bg: '#450a0a', border: '#b91c1c', dot: '#ef4444' }
+                        };
 
-                            {(isOverCollected || isUnderwater) && (
-                              <div style={{
-                                ...styles.warningBadge,
-                                backgroundColor: isOverCollected ? '#fef2f2' : '#fffbeb',
-                                color: isOverCollected ? '#dc2626' : '#d97706'
-                              }}>
-                                {isOverCollected ? '⚠ Over-collected from client!' : '⚠ Spent more than collected'}
+                        if (mode === 'separate') {
+                          // SEPARATE MODE CARD - Labor & Materials tracked separately
+                          const laborWarning = warningColors[totals.laborWarningLevel];
+                          const laborCollectedPct = category.laborBudget > 0
+                            ? (totals.laborCollected / category.laborBudget) * 100 : 0;
+                          const laborPaidPct = category.laborCost > 0
+                            ? (totals.laborPaid / category.laborCost) * 100 : 0;
+                          const materialsCollectedPct = category.materialsBudget > 0
+                            ? (totals.materialsCollected / category.materialsBudget) * 100 : 0;
+                          const materialsPaidPct = totals.materialsCollected > 0
+                            ? (totals.materialsPaid / totals.materialsCollected) * 100 : 0;
+
+                          return (
+                            <div key={category.id} style={{
+                              ...styles.categoryCard,
+                              borderColor: laborWarning.border
+                            }}>
+                              <div style={styles.categoryHeader}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  <span style={{
+                                    ...styles.warningDot,
+                                    backgroundColor: laborWarning.dot
+                                  }}></span>
+                                  <h3 style={styles.categoryName}>{category.name}</h3>
+                                  <span style={styles.modeBadgeSmall}>SEP</span>
+                                </div>
+                                <button
+                                  style={styles.deleteBtn}
+                                  onClick={() => deleteCategory(category.id)}
+                                >
+                                  ×
+                                </button>
                               </div>
-                            )}
 
-                            <div style={styles.categoryRow}>
-                              <span style={styles.categoryLabel}>Client Budget:</span>
-                              <span style={styles.categoryAmount}>{formatCurrency(category.clientBudget)}</span>
-                            </div>
-                            <div style={styles.categoryRow}>
-                              <span style={styles.categoryLabel}>Your Real Cost:</span>
-                              <span style={styles.categoryAmount}>{formatCurrency(category.yourCost)}</span>
-                            </div>
-
-                            <div style={styles.divider}></div>
-
-                            <div style={styles.progressSection}>
-                              <div style={styles.progressLabel}>
-                                <span>Client Paid</span>
-                                <span style={{color: '#10b981'}}>{formatCurrency(totals.clientPaid)}</span>
-                              </div>
-                              <div style={styles.progressBar}>
+                              {totals.laborWarningLevel === 'red' && (
                                 <div style={{
-                                  ...styles.progressFill,
-                                  width: `${Math.min(clientProgress, 100)}%`,
-                                  backgroundColor: isOverCollected ? '#ef4444' : '#10b981'
-                                }}></div>
-                              </div>
-                              <div style={styles.progressSubtext}>
-                                {formatCurrency(totals.remaining)} remaining to collect
-                              </div>
-                            </div>
-
-                            <div style={styles.progressSection}>
-                              <div style={styles.progressLabel}>
-                                <span>You've Paid Sub</span>
-                                <span style={{color: '#f59e0b'}}>{formatCurrency(totals.youPaid)}</span>
-                              </div>
-                              <div style={styles.progressBar}>
+                                  ...styles.warningBadge,
+                                  backgroundColor: '#fef2f2',
+                                  color: '#dc2626'
+                                }}>
+                                  ⚠ Can't cover sub! Need {formatCurrency(Math.abs(totals.laborBuffer))} more
+                                </div>
+                              )}
+                              {totals.laborWarningLevel === 'yellow' && (
                                 <div style={{
-                                  ...styles.progressFill,
-                                  width: `${Math.min(yourProgress, 100)}%`,
-                                  backgroundColor: '#f59e0b'
-                                }}></div>
-                              </div>
-                              <div style={styles.progressSubtext}>
-                                {formatCurrency(totals.yourRemaining)} left to pay sub
-                              </div>
-                            </div>
+                                  ...styles.warningBadge,
+                                  backgroundColor: '#fefce8',
+                                  color: '#a16207'
+                                }}>
+                                  ⚠ Low buffer - only {formatCurrency(totals.laborBuffer)} cushion
+                                </div>
+                              )}
 
-                            <div style={styles.divider}></div>
+                              {/* LABOR SECTION */}
+                              <div style={styles.subSection}>
+                                <div style={styles.subSectionTitle}>Labor</div>
+                                <div style={styles.categoryRow}>
+                                  <span style={styles.categoryLabel}>Budget from Client:</span>
+                                  <span style={styles.categoryAmount}>{formatCurrency(category.laborBudget)}</span>
+                                </div>
+                                <div style={styles.categoryRow}>
+                                  <span style={styles.categoryLabel}>Your Cost to Sub:</span>
+                                  <span style={styles.categoryAmount}>{formatCurrency(category.laborCost)}</span>
+                                </div>
+                                <div style={styles.progressSection}>
+                                  <div style={styles.progressLabel}>
+                                    <span>Collected</span>
+                                    <span style={{color: '#10b981'}}>{formatCurrency(totals.laborCollected)}</span>
+                                  </div>
+                                  <div style={styles.progressBar}>
+                                    <div style={{
+                                      ...styles.progressFill,
+                                      width: `${Math.min(laborCollectedPct, 100)}%`,
+                                      backgroundColor: '#10b981'
+                                    }}></div>
+                                  </div>
+                                </div>
+                                <div style={styles.progressSection}>
+                                  <div style={styles.progressLabel}>
+                                    <span>Paid to Sub</span>
+                                    <span style={{color: '#f59e0b'}}>{formatCurrency(totals.laborPaid)}</span>
+                                  </div>
+                                  <div style={styles.progressBar}>
+                                    <div style={{
+                                      ...styles.progressFill,
+                                      width: `${Math.min(laborPaidPct, 100)}%`,
+                                      backgroundColor: '#f59e0b'
+                                    }}></div>
+                                  </div>
+                                </div>
+                                <div style={styles.categoryRow}>
+                                  <span style={styles.categoryLabel}>Projected Profit:</span>
+                                  <span style={{
+                                    ...styles.categoryAmount,
+                                    color: totals.laborProfit >= 0 ? '#10b981' : '#ef4444'
+                                  }}>
+                                    {formatCurrency(totals.laborProfit)}
+                                  </span>
+                                </div>
+                              </div>
 
-                            <div style={styles.categoryRow}>
-                              <span style={styles.categoryLabel}>Projected Profit:</span>
-                              <span style={{
-                                ...styles.categoryAmount,
-                                color: totals.projectedProfit >= 0 ? '#10b981' : '#ef4444'
-                              }}>
-                                {formatCurrency(totals.projectedProfit)}
-                              </span>
+                              <div style={styles.divider}></div>
+
+                              {/* MATERIALS SECTION */}
+                              <div style={styles.subSection}>
+                                <div style={styles.subSectionTitle}>Materials (Pass-through)</div>
+                                <div style={styles.categoryRow}>
+                                  <span style={styles.categoryLabel}>Budget:</span>
+                                  <span style={styles.categoryAmount}>{formatCurrency(category.materialsBudget)}</span>
+                                </div>
+                                <div style={styles.progressSection}>
+                                  <div style={styles.progressLabel}>
+                                    <span>Collected</span>
+                                    <span style={{color: '#10b981'}}>{formatCurrency(totals.materialsCollected)}</span>
+                                  </div>
+                                  <div style={styles.progressBar}>
+                                    <div style={{
+                                      ...styles.progressFill,
+                                      width: `${Math.min(materialsCollectedPct, 100)}%`,
+                                      backgroundColor: '#10b981'
+                                    }}></div>
+                                  </div>
+                                </div>
+                                <div style={styles.progressSection}>
+                                  <div style={styles.progressLabel}>
+                                    <span>Spent</span>
+                                    <span style={{color: '#f59e0b'}}>{formatCurrency(totals.materialsPaid)}</span>
+                                  </div>
+                                  <div style={styles.progressBar}>
+                                    <div style={{
+                                      ...styles.progressFill,
+                                      width: `${Math.min(materialsPaidPct, 100)}%`,
+                                      backgroundColor: '#f59e0b'
+                                    }}></div>
+                                  </div>
+                                </div>
+                              </div>
                             </div>
-                            <div style={styles.categoryRow}>
-                              <span style={styles.categoryLabel}>Current Margin:</span>
-                              <span style={{
-                                ...styles.categoryAmount,
-                                color: totals.profit >= 0 ? '#10b981' : '#ef4444'
-                              }}>
-                                {formatCurrency(totals.profit)}
-                              </span>
+                          );
+                        } else {
+                          // ALL-INCLUSIVE MODE CARD - Original style with warning indicators
+                          const warning = warningColors[totals.warningLevel];
+                          const collectedPct = totals.budget > 0
+                            ? (totals.collected / totals.budget) * 100 : 0;
+                          const paidPct = totals.cost > 0
+                            ? (totals.paid / totals.cost) * 100 : 0;
+
+                          return (
+                            <div key={category.id} style={{
+                              ...styles.categoryCard,
+                              borderColor: warning.border
+                            }}>
+                              <div style={styles.categoryHeader}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  <span style={{
+                                    ...styles.warningDot,
+                                    backgroundColor: warning.dot
+                                  }}></span>
+                                  <h3 style={styles.categoryName}>{category.name}</h3>
+                                  <span style={styles.modeBadgeSmall}>ALL</span>
+                                </div>
+                                <button
+                                  style={styles.deleteBtn}
+                                  onClick={() => deleteCategory(category.id)}
+                                >
+                                  ×
+                                </button>
+                              </div>
+
+                              {totals.warningLevel === 'red' && (
+                                <div style={{
+                                  ...styles.warningBadge,
+                                  backgroundColor: '#fef2f2',
+                                  color: '#dc2626'
+                                }}>
+                                  ⚠ Can't cover sub! Need {formatCurrency(Math.abs(totals.buffer))} more
+                                </div>
+                              )}
+                              {totals.warningLevel === 'yellow' && (
+                                <div style={{
+                                  ...styles.warningBadge,
+                                  backgroundColor: '#fefce8',
+                                  color: '#a16207'
+                                }}>
+                                  ⚠ Low buffer - only {formatCurrency(totals.buffer)} cushion
+                                </div>
+                              )}
+
+                              <div style={styles.categoryRow}>
+                                <span style={styles.categoryLabel}>Client Budget:</span>
+                                <span style={styles.categoryAmount}>{formatCurrency(totals.budget)}</span>
+                              </div>
+                              <div style={styles.categoryRow}>
+                                <span style={styles.categoryLabel}>Your Cost:</span>
+                                <span style={styles.categoryAmount}>{formatCurrency(totals.cost)}</span>
+                              </div>
+
+                              <div style={styles.divider}></div>
+
+                              <div style={styles.progressSection}>
+                                <div style={styles.progressLabel}>
+                                  <span>Collected from Client</span>
+                                  <span style={{color: '#10b981'}}>{formatCurrency(totals.collected)}</span>
+                                </div>
+                                <div style={styles.progressBar}>
+                                  <div style={{
+                                    ...styles.progressFill,
+                                    width: `${Math.min(collectedPct, 100)}%`,
+                                    backgroundColor: '#10b981'
+                                  }}></div>
+                                </div>
+                                <div style={styles.progressSubtext}>
+                                  {formatCurrency(totals.remainingToCollect)} remaining to collect
+                                </div>
+                              </div>
+
+                              <div style={styles.progressSection}>
+                                <div style={styles.progressLabel}>
+                                  <span>Paid to Sub</span>
+                                  <span style={{color: '#f59e0b'}}>{formatCurrency(totals.paid)}</span>
+                                </div>
+                                <div style={styles.progressBar}>
+                                  <div style={{
+                                    ...styles.progressFill,
+                                    width: `${Math.min(paidPct, 100)}%`,
+                                    backgroundColor: '#f59e0b'
+                                  }}></div>
+                                </div>
+                                <div style={styles.progressSubtext}>
+                                  {formatCurrency(totals.remainingToPay)} left to pay sub
+                                </div>
+                              </div>
+
+                              <div style={styles.divider}></div>
+
+                              <div style={styles.categoryRow}>
+                                <span style={styles.categoryLabel}>Projected Profit:</span>
+                                <span style={{
+                                  ...styles.categoryAmount,
+                                  color: totals.projectedProfit >= 0 ? '#10b981' : '#ef4444'
+                                }}>
+                                  {formatCurrency(totals.projectedProfit)}
+                                </span>
+                              </div>
+                              <div style={styles.categoryRow}>
+                                <span style={styles.categoryLabel}>Current Margin:</span>
+                                <span style={{
+                                  ...styles.categoryAmount,
+                                  color: totals.currentMargin >= 0 ? '#10b981' : '#ef4444'
+                                }}>
+                                  {formatCurrency(totals.currentMargin)}
+                                </span>
+                              </div>
                             </div>
-                          </div>
-                        );
+                          );
+                        }
                       })}
                     </div>
                   )}
@@ -524,42 +858,71 @@ const ContractorCRM = () => {
                     </div>
                   ) : (
                     <div style={styles.paymentList}>
-                      {currentProject.payments.sort((a, b) => new Date(b.date) - new Date(a.date)).map(payment => (
-                        <div key={payment.id} style={styles.paymentCard}>
-                          <div style={styles.paymentHeader}>
-                            <div>
-                              <div style={styles.paymentCheck}>Check #{payment.checkNumber}</div>
-                              <div style={styles.paymentDate}>{formatDate(payment.date)}</div>
-                            </div>
-                            <div style={styles.paymentAmountSection}>
-                              <div style={styles.paymentTotal}>{formatCurrency(payment.totalAmount)}</div>
-                              <button
-                                style={styles.deleteBtn}
-                                onClick={() => deletePayment(payment.id)}
-                              >
-                                ×
-                              </button>
-                            </div>
-                          </div>
+                      {currentProject.payments.sort((a, b) => new Date(b.date) - new Date(a.date)).map(payment => {
+                        const methodLabel = {
+                          check: 'Check',
+                          zelle: 'Zelle',
+                          cash: 'Cash',
+                          other: 'Other'
+                        }[payment.paymentMethod || 'check'];
+                        const ref = payment.reference || payment.checkNumber || '';
 
-                          {payment.notes && (
-                            <div style={styles.paymentNotes}>{payment.notes}</div>
-                          )}
-
-                          <div style={styles.allocationList}>
-                            <div style={styles.allocationHeader}>Allocated to:</div>
-                            {payment.allocations.map((alloc, idx) => {
-                              const cat = currentProject.categories.find(c => c.id === alloc.categoryId);
-                              return (
-                                <div key={idx} style={styles.allocationItem}>
-                                  <span>{cat?.name || 'Unknown'}</span>
-                                  <span>{formatCurrency(alloc.amount)}</span>
+                        return (
+                          <div key={payment.id} style={styles.paymentCard}>
+                            <div style={styles.paymentHeader}>
+                              <div>
+                                <div style={styles.paymentCheck}>
+                                  {methodLabel}{ref ? ` #${ref}` : ''}
                                 </div>
-                              );
-                            })}
+                                <div style={styles.paymentDate}>{formatDate(payment.date)}</div>
+                              </div>
+                              <div style={styles.paymentAmountSection}>
+                                <div style={styles.paymentTotal}>{formatCurrency(payment.totalAmount)}</div>
+                                <button
+                                  style={styles.deleteBtn}
+                                  onClick={() => deletePayment(payment.id)}
+                                >
+                                  ×
+                                </button>
+                              </div>
+                            </div>
+
+                            {payment.notes && (
+                              <div style={styles.paymentNotes}>{payment.notes}</div>
+                            )}
+
+                            <div style={styles.allocationList}>
+                              <div style={styles.allocationHeader}>Allocated to:</div>
+                              {payment.allocations.filter(a =>
+                                (a.amount > 0) || (a.laborAmount > 0) || (a.materialsAmount > 0)
+                              ).map((alloc, idx) => {
+                                const cat = currentProject.categories.find(c => c.id === alloc.categoryId);
+                                const catMode = cat?.mode || 'all-inclusive';
+
+                                if (catMode === 'separate') {
+                                  // Show labor/materials breakdown for separate mode
+                                  const parts = [];
+                                  if (alloc.laborAmount > 0) parts.push(`Labor: ${formatCurrency(alloc.laborAmount)}`);
+                                  if (alloc.materialsAmount > 0) parts.push(`Materials: ${formatCurrency(alloc.materialsAmount)}`);
+                                  return (
+                                    <div key={idx} style={styles.allocationItem}>
+                                      <span>{cat?.name || 'Unknown'}</span>
+                                      <span style={{ fontSize: '12px' }}>{parts.join(' / ')}</span>
+                                    </div>
+                                  );
+                                }
+
+                                return (
+                                  <div key={idx} style={styles.allocationItem}>
+                                    <span>{cat?.name || 'Unknown'}</span>
+                                    <span>{formatCurrency(alloc.amount)}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -586,14 +949,37 @@ const ContractorCRM = () => {
                     <div style={styles.expenseList}>
                       {currentProject.categories.map(category => {
                         if (category.expenses.length === 0) return null;
+                        const catMode = category.mode || 'all-inclusive';
                         return (
                           <div key={category.id} style={styles.expenseGroup}>
-                            <h3 style={styles.expenseGroupTitle}>{category.name}</h3>
+                            <h3 style={styles.expenseGroupTitle}>
+                              {category.name}
+                              <span style={styles.modeBadge}>
+                                {catMode === 'separate' ? 'SEP' : 'ALL'}
+                              </span>
+                            </h3>
                             {category.expenses.sort((a, b) => new Date(b.date) - new Date(a.date)).map(expense => (
                               <div key={expense.id} style={styles.expenseItem}>
                                 <div>
-                                  <div style={styles.expenseDesc}>{expense.description}</div>
-                                  <div style={styles.expenseDate}>{formatDate(expense.date)}</div>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <span style={styles.expenseDesc}>{expense.description}</span>
+                                    {catMode === 'separate' && expense.type && (
+                                      <span style={{
+                                        ...styles.typeBadge,
+                                        ...(expense.type === 'labor' ? styles.typeBadgeLabor : styles.typeBadgeMaterials)
+                                      }}>
+                                        {expense.type}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div style={styles.expenseDate}>
+                                    {formatDate(expense.date)}
+                                    {expense.paymentMethod && (
+                                      <span style={{ marginLeft: '8px', color: '#64748b' }}>
+                                        via {expense.paymentMethod}{expense.reference ? ` #${expense.reference}` : ''}
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                                 <div style={styles.expenseAmountSection}>
                                   <div style={styles.expenseAmount}>{formatCurrency(expense.amount)}</div>
@@ -713,11 +1099,30 @@ const NewProjectForm = ({ onSubmit, onCancel }) => {
 
 const NewCategoryForm = ({ onSubmit, onCancel }) => {
   const [name, setName] = useState('');
-  const [clientBudget, setClientBudget] = useState('');
-  const [yourCost, setYourCost] = useState('');
+  const [mode, setMode] = useState('all-inclusive');
+  // All-inclusive fields
+  const [totalBudget, setTotalBudget] = useState('');
+  const [totalCost, setTotalCost] = useState('');
+  // Separate mode fields
+  const [laborBudget, setLaborBudget] = useState('');
+  const [laborCost, setLaborCost] = useState('');
+  const [materialsBudget, setMaterialsBudget] = useState('');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSubmit({
+      name,
+      mode,
+      totalBudget: mode === 'all-inclusive' ? totalBudget : null,
+      totalCost: mode === 'all-inclusive' ? totalCost : null,
+      laborBudget: mode === 'separate' ? laborBudget : null,
+      laborCost: mode === 'separate' ? laborCost : null,
+      materialsBudget: mode === 'separate' ? materialsBudget : null
+    });
+  };
 
   return (
-    <form onSubmit={e => { e.preventDefault(); onSubmit(name, clientBudget, yourCost); }}>
+    <form onSubmit={handleSubmit}>
       <div style={styles.formGroup}>
         <label style={styles.label}>Category Name</label>
         <input
@@ -728,28 +1133,116 @@ const NewCategoryForm = ({ onSubmit, onCancel }) => {
           required
         />
       </div>
+
       <div style={styles.formGroup}>
-        <label style={styles.label}>Client Budget (what they'll pay)</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={clientBudget}
-          onChange={e => setClientBudget(e.target.value)}
-          placeholder="30000"
-          required
-        />
+        <label style={styles.label}>Category Type</label>
+        <div style={styles.modeToggle}>
+          <div
+            style={{
+              ...styles.modeOption,
+              ...(mode === 'all-inclusive' ? styles.modeOptionActive : {})
+            }}
+            onClick={() => setMode('all-inclusive')}
+          >
+            <div style={styles.modeTitle}>All-Inclusive</div>
+            <div style={styles.modeDesc}>Sub handles everything for one price</div>
+          </div>
+          <div
+            style={{
+              ...styles.modeOption,
+              ...(mode === 'separate' ? styles.modeOptionActive : {})
+            }}
+            onClick={() => setMode('separate')}
+          >
+            <div style={styles.modeTitle}>Separate Labor/Materials</div>
+            <div style={styles.modeDesc}>You handle materials separately</div>
+          </div>
+        </div>
       </div>
-      <div style={styles.formGroup}>
-        <label style={styles.label}>Your Actual Cost (what you'll pay sub)</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={yourCost}
-          onChange={e => setYourCost(e.target.value)}
-          placeholder="22000"
-          required
-        />
-      </div>
+
+      {mode === 'all-inclusive' ? (
+        <>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Total Budget (what client pays)</label>
+            <input
+              style={styles.input}
+              type="number"
+              value={totalBudget}
+              onChange={e => setTotalBudget(e.target.value)}
+              placeholder="30000"
+              required
+            />
+          </div>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Your Cost (what you pay sub)</label>
+            <input
+              style={styles.input}
+              type="number"
+              value={totalCost}
+              onChange={e => setTotalCost(e.target.value)}
+              placeholder="22000"
+              required
+            />
+          </div>
+          {totalBudget && totalCost && (
+            <div style={styles.formGroup}>
+              <div style={styles.profitPreview}>
+                Projected Profit: <span style={{color: '#10b981'}}>${(parseFloat(totalBudget) - parseFloat(totalCost)).toLocaleString()}</span>
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <div style={styles.formSectionLabel}>LABOR (your margin)</div>
+          <div style={{...styles.formRow, padding: '0 24px'}}>
+            <div style={{...styles.formGroup, padding: 0, flex: 1}}>
+              <label style={styles.label}>Labor Budget (client pays)</label>
+              <input
+                style={styles.input}
+                type="number"
+                value={laborBudget}
+                onChange={e => setLaborBudget(e.target.value)}
+                placeholder="45000"
+                required
+              />
+            </div>
+            <div style={{...styles.formGroup, padding: 0, flex: 1}}>
+              <label style={styles.label}>Labor Cost (you pay sub)</label>
+              <input
+                style={styles.input}
+                type="number"
+                value={laborCost}
+                onChange={e => setLaborCost(e.target.value)}
+                placeholder="32000"
+                required
+              />
+            </div>
+          </div>
+          {laborBudget && laborCost && (
+            <div style={styles.formGroup}>
+              <div style={styles.profitPreview}>
+                Labor Profit: <span style={{color: '#10b981'}}>${(parseFloat(laborBudget) - parseFloat(laborCost)).toLocaleString()}</span>
+              </div>
+            </div>
+          )}
+
+          <div style={styles.formSectionLabel}>MATERIALS (pass-through)</div>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Materials Budget (client pays actual cost)</label>
+            <input
+              style={styles.input}
+              type="number"
+              value={materialsBudget}
+              onChange={e => setMaterialsBudget(e.target.value)}
+              placeholder="25000"
+              required
+            />
+            <div style={styles.inputHint}>Materials are pass-through - no markup</div>
+          </div>
+        </>
+      )}
+
       <div style={styles.formActions}>
         <button type="button" style={styles.cancelBtn} onClick={onCancel}>Cancel</button>
         <button type="submit" style={styles.submitBtn}>Add Category</button>
@@ -759,27 +1252,90 @@ const NewCategoryForm = ({ onSubmit, onCancel }) => {
 };
 
 const NewPaymentForm = ({ categories, onSubmit, onCancel }) => {
-  const [checkNumber, setCheckNumber] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('check');
+  const [reference, setReference] = useState('');
   const [totalAmount, setTotalAmount] = useState('');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [notes, setNotes] = useState('');
   const [allocations, setAllocations] = useState(
-    categories.map(c => ({ categoryId: c.id, amount: '' }))
+    categories.map(c => ({
+      categoryId: c.id,
+      mode: c.mode || 'all-inclusive',
+      amount: '',       // for all-inclusive
+      laborAmount: '',  // for separate
+      materialsAmount: '' // for separate
+    }))
   );
 
-  const allocatedTotal = allocations.reduce((sum, a) => sum + (parseFloat(a.amount) || 0), 0);
+  // Calculate total allocated considering both modes
+  const allocatedTotal = allocations.reduce((sum, a) => {
+    if (a.mode === 'separate') {
+      return sum + (parseFloat(a.laborAmount) || 0) + (parseFloat(a.materialsAmount) || 0);
+    }
+    return sum + (parseFloat(a.amount) || 0);
+  }, 0);
   const remaining = (parseFloat(totalAmount) || 0) - allocatedTotal;
 
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSubmit({
+      paymentMethod,
+      reference,
+      totalAmount,
+      date,
+      notes,
+      allocations: allocations.map(a => ({
+        categoryId: a.categoryId,
+        amount: a.mode === 'all-inclusive' ? (parseFloat(a.amount) || 0) : 0,
+        laborAmount: a.mode === 'separate' ? (parseFloat(a.laborAmount) || 0) : 0,
+        materialsAmount: a.mode === 'separate' ? (parseFloat(a.materialsAmount) || 0) : 0
+      }))
+    });
+  };
+
+  const paymentMethods = [
+    { value: 'check', label: 'Check' },
+    { value: 'zelle', label: 'Zelle' },
+    { value: 'cash', label: 'Cash' },
+    { value: 'other', label: 'Other' }
+  ];
+
   return (
-    <form onSubmit={e => { e.preventDefault(); onSubmit(checkNumber, totalAmount, allocations.map(a => ({...a, amount: parseFloat(a.amount) || 0})), date, notes); }}>
+    <form onSubmit={handleSubmit}>
       <div style={styles.formRow}>
         <div style={styles.formGroup}>
-          <label style={styles.label}>Check #</label>
+          <label style={styles.label}>Payment Method</label>
+          <select
+            style={styles.input}
+            value={paymentMethod}
+            onChange={e => setPaymentMethod(e.target.value)}
+          >
+            {paymentMethods.map(pm => (
+              <option key={pm.value} value={pm.value}>{pm.label}</option>
+            ))}
+          </select>
+        </div>
+        <div style={styles.formGroup}>
+          <label style={styles.label}>
+            {paymentMethod === 'check' ? 'Check #' : 'Reference'}
+          </label>
           <input
             style={styles.input}
-            value={checkNumber}
-            onChange={e => setCheckNumber(e.target.value)}
-            placeholder="1234"
+            value={reference}
+            onChange={e => setReference(e.target.value)}
+            placeholder={paymentMethod === 'check' ? '1234' : 'Confirmation #'}
+          />
+        </div>
+      </div>
+      <div style={styles.formRow}>
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Total Amount</label>
+          <input
+            style={styles.input}
+            type="number"
+            value={totalAmount}
+            onChange={e => setTotalAmount(e.target.value)}
+            placeholder="20000"
             required
           />
         </div>
@@ -794,36 +1350,70 @@ const NewPaymentForm = ({ categories, onSubmit, onCancel }) => {
           />
         </div>
       </div>
-      <div style={styles.formGroup}>
-        <label style={styles.label}>Total Amount</label>
-        <input
-          style={styles.input}
-          type="number"
-          value={totalAmount}
-          onChange={e => setTotalAmount(e.target.value)}
-          placeholder="20000"
-          required
-        />
-      </div>
 
       <div style={styles.allocationSection}>
         <label style={styles.label}>Allocate to Categories</label>
-        {categories.map((cat, idx) => (
-          <div key={cat.id} style={styles.allocationRow}>
-            <span style={styles.allocationCatName}>{cat.name}</span>
-            <input
-              style={{...styles.input, width: '120px'}}
-              type="number"
-              value={allocations[idx].amount}
-              onChange={e => {
-                const newAllocs = [...allocations];
-                newAllocs[idx].amount = e.target.value;
-                setAllocations(newAllocs);
-              }}
-              placeholder="0"
-            />
+
+        {/* Header row for separate mode */}
+        {categories.some(c => (c.mode || 'all-inclusive') === 'separate') && (
+          <div style={styles.allocationHeaderRow}>
+            <span style={{flex: 1}}>Category</span>
+            <span style={{width: '80px', textAlign: 'center', fontSize: '11px'}}>Labor</span>
+            <span style={{width: '80px', textAlign: 'center', fontSize: '11px'}}>Materials</span>
           </div>
-        ))}
+        )}
+
+        {categories.map((cat, idx) => {
+          const catMode = cat.mode || 'all-inclusive';
+          return (
+            <div key={cat.id} style={styles.allocationRow}>
+              <span style={styles.allocationCatName}>
+                {cat.name}
+                <span style={styles.modeBadge}>
+                  {catMode === 'separate' ? 'Sep' : 'All'}
+                </span>
+              </span>
+              {catMode === 'separate' ? (
+                <div style={styles.allocationInputs}>
+                  <input
+                    style={{...styles.input, width: '80px'}}
+                    type="number"
+                    value={allocations[idx].laborAmount}
+                    onChange={e => {
+                      const newAllocs = [...allocations];
+                      newAllocs[idx].laborAmount = e.target.value;
+                      setAllocations(newAllocs);
+                    }}
+                    placeholder="0"
+                  />
+                  <input
+                    style={{...styles.input, width: '80px'}}
+                    type="number"
+                    value={allocations[idx].materialsAmount}
+                    onChange={e => {
+                      const newAllocs = [...allocations];
+                      newAllocs[idx].materialsAmount = e.target.value;
+                      setAllocations(newAllocs);
+                    }}
+                    placeholder="0"
+                  />
+                </div>
+              ) : (
+                <input
+                  style={{...styles.input, width: '120px'}}
+                  type="number"
+                  value={allocations[idx].amount}
+                  onChange={e => {
+                    const newAllocs = [...allocations];
+                    newAllocs[idx].amount = e.target.value;
+                    setAllocations(newAllocs);
+                  }}
+                  placeholder="0"
+                />
+              )}
+            </div>
+          );
+        })}
         <div style={{
           ...styles.allocationSummary,
           color: remaining < 0 ? '#ef4444' : remaining > 0 ? '#f59e0b' : '#10b981'
@@ -854,12 +1444,31 @@ const NewPaymentForm = ({ categories, onSubmit, onCancel }) => {
 
 const NewExpenseForm = ({ categories, onSubmit, onCancel }) => {
   const [categoryId, setCategoryId] = useState(categories[0]?.id || '');
+  const [expenseType, setExpenseType] = useState('labor');
   const [amount, setAmount] = useState('');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [description, setDescription] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('');
+  const [reference, setReference] = useState('');
+
+  const selectedCategory = categories.find(c => c.id === parseInt(categoryId) || c.id === categoryId);
+  const isSeparateMode = selectedCategory && (selectedCategory.mode === 'separate');
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    onSubmit({
+      categoryId: parseInt(categoryId) || categoryId,
+      amount,
+      date,
+      description,
+      type: isSeparateMode ? expenseType : null,
+      paymentMethod: paymentMethod || null,
+      reference: reference || null
+    });
+  };
 
   return (
-    <form onSubmit={e => { e.preventDefault(); onSubmit(parseInt(categoryId), amount, date, description); }}>
+    <form onSubmit={handleSubmit}>
       <div style={styles.formGroup}>
         <label style={styles.label}>Category</label>
         <select
@@ -869,10 +1478,41 @@ const NewExpenseForm = ({ categories, onSubmit, onCancel }) => {
           required
         >
           {categories.map(cat => (
-            <option key={cat.id} value={cat.id}>{cat.name}</option>
+            <option key={cat.id} value={cat.id}>
+              {cat.name} ({(cat.mode || 'all-inclusive') === 'separate' ? 'Separate' : 'All-Inclusive'})
+            </option>
           ))}
         </select>
       </div>
+
+      {isSeparateMode && (
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Expense Type</label>
+          <div style={styles.typeToggle}>
+            <button
+              type="button"
+              style={{
+                ...styles.typeBtn,
+                ...(expenseType === 'labor' ? styles.typeBtnActive : {})
+              }}
+              onClick={() => setExpenseType('labor')}
+            >
+              Labor
+            </button>
+            <button
+              type="button"
+              style={{
+                ...styles.typeBtn,
+                ...(expenseType === 'materials' ? styles.typeBtnActiveMaterials : {})
+              }}
+              onClick={() => setExpenseType('materials')}
+            >
+              Materials
+            </button>
+          </div>
+        </div>
+      )}
+
       <div style={styles.formRow}>
         <div style={styles.formGroup}>
           <label style={styles.label}>Amount</label>
@@ -896,6 +1536,7 @@ const NewExpenseForm = ({ categories, onSubmit, onCancel }) => {
           />
         </div>
       </div>
+
       <div style={styles.formGroup}>
         <label style={styles.label}>Description</label>
         <input
@@ -906,6 +1547,33 @@ const NewExpenseForm = ({ categories, onSubmit, onCancel }) => {
           required
         />
       </div>
+
+      <div style={styles.formRow}>
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Payment Method (optional)</label>
+          <select
+            style={styles.input}
+            value={paymentMethod}
+            onChange={e => setPaymentMethod(e.target.value)}
+          >
+            <option value="">-- Select --</option>
+            <option value="check">Check</option>
+            <option value="zelle">Zelle</option>
+            <option value="cash">Cash</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div style={styles.formGroup}>
+          <label style={styles.label}>Reference # (optional)</label>
+          <input
+            style={styles.input}
+            value={reference}
+            onChange={e => setReference(e.target.value)}
+            placeholder="Check # or confirmation"
+          />
+        </div>
+      </div>
+
       <div style={styles.formActions}>
         <button type="button" style={styles.cancelBtn} onClick={onCancel}>Cancel</button>
         <button type="submit" style={styles.submitBtn}>Record Expense</button>
@@ -1057,7 +1725,7 @@ const styles = {
   },
   summaryGrid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(5, 1fr)',
+    gridTemplateColumns: 'repeat(6, 1fr)',
     gap: '16px',
     marginBottom: '32px',
   },
@@ -1472,6 +2140,181 @@ const styles = {
     fontSize: '13px',
     fontWeight: '500',
     textAlign: 'center',
+  },
+  // Mode toggle styles
+  modeToggle: {
+    display: 'flex',
+    gap: '4px',
+    padding: '4px',
+    backgroundColor: '#0f172a',
+    borderRadius: '8px',
+    marginBottom: '16px',
+  },
+  modeToggleBtn: {
+    flex: 1,
+    padding: '8px 12px',
+    borderRadius: '6px',
+    border: 'none',
+    backgroundColor: 'transparent',
+    color: '#64748b',
+    fontSize: '13px',
+    fontWeight: '500',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  },
+  modeToggleBtnActive: {
+    backgroundColor: '#334155',
+    color: '#f1f5f9',
+  },
+  // Warning dot indicator
+  warningDot: {
+    width: '10px',
+    height: '10px',
+    borderRadius: '50%',
+    flexShrink: 0,
+  },
+  // Mode badges
+  modeBadge: {
+    fontSize: '10px',
+    fontWeight: '600',
+    padding: '2px 6px',
+    borderRadius: '4px',
+    backgroundColor: '#334155',
+    color: '#94a3b8',
+    marginLeft: '8px',
+  },
+  modeBadgeSmall: {
+    fontSize: '9px',
+    fontWeight: '700',
+    padding: '2px 5px',
+    borderRadius: '3px',
+    backgroundColor: '#334155',
+    color: '#64748b',
+    letterSpacing: '0.5px',
+  },
+  // Sub-section for separate mode cards
+  subSection: {
+    marginBottom: '8px',
+  },
+  subSectionTitle: {
+    fontSize: '11px',
+    fontWeight: '600',
+    color: '#64748b',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+    marginBottom: '8px',
+  },
+  // Allocation header row for payment form
+  allocationHeaderRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '8px 0',
+    borderBottom: '1px solid #334155',
+    marginBottom: '8px',
+    fontSize: '11px',
+    fontWeight: '600',
+    color: '#64748b',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+  },
+  // Allocation inputs container
+  allocationInputs: {
+    display: 'flex',
+    gap: '8px',
+  },
+  // Type toggle for expense form
+  typeToggle: {
+    display: 'flex',
+    gap: '8px',
+    marginTop: '8px',
+  },
+  typeToggleBtn: {
+    flex: 1,
+    padding: '10px',
+    borderRadius: '8px',
+    border: '1px solid #334155',
+    backgroundColor: 'transparent',
+    color: '#94a3b8',
+    fontSize: '13px',
+    fontWeight: '500',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  },
+  typeToggleBtnActive: {
+    borderColor: '#3b82f6',
+    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+    color: '#3b82f6',
+  },
+  typeBtn: {
+    flex: 1,
+    padding: '10px',
+    borderRadius: '8px',
+    border: '1px solid #334155',
+    backgroundColor: 'transparent',
+    color: '#94a3b8',
+    fontSize: '13px',
+    fontWeight: '500',
+    cursor: 'pointer',
+    transition: 'all 0.15s ease',
+  },
+  typeBtnActive: {
+    borderColor: '#8b5cf6',
+    backgroundColor: 'rgba(139, 92, 246, 0.15)',
+    color: '#a78bfa',
+  },
+  typeBtnActiveMaterials: {
+    borderColor: '#06b6d4',
+    backgroundColor: 'rgba(6, 182, 212, 0.15)',
+    color: '#22d3ee',
+  },
+  // Expense type badge
+  typeBadge: {
+    fontSize: '10px',
+    fontWeight: '600',
+    padding: '3px 8px',
+    borderRadius: '4px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.5px',
+  },
+  typeBadgeLabor: {
+    backgroundColor: 'rgba(139, 92, 246, 0.15)',
+    color: '#a78bfa',
+  },
+  typeBadgeMaterials: {
+    backgroundColor: 'rgba(6, 182, 212, 0.15)',
+    color: '#22d3ee',
+  },
+  // Health indicators for dashboard
+  healthIndicators: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '6px',
+    marginBottom: '8px',
+  },
+  healthBadgeRed: {
+    padding: '4px 10px',
+    borderRadius: '12px',
+    fontSize: '12px',
+    fontWeight: '600',
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    color: '#ef4444',
+  },
+  healthBadgeYellow: {
+    padding: '4px 10px',
+    borderRadius: '12px',
+    fontSize: '12px',
+    fontWeight: '600',
+    backgroundColor: 'rgba(234, 179, 8, 0.15)',
+    color: '#eab308',
+  },
+  healthBadgeGreen: {
+    padding: '4px 10px',
+    borderRadius: '12px',
+    fontSize: '12px',
+    fontWeight: '600',
+    backgroundColor: 'rgba(34, 197, 94, 0.15)',
+    color: '#22c55e',
   },
 };
 

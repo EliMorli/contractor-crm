@@ -11,6 +11,67 @@ export const supabase = supabaseUrl && supabaseAnonKey
   ? createClient(supabaseUrl, supabaseAnonKey)
   : null;
 
+// Schema version for migrations
+const SCHEMA_VERSION = 2;
+
+// Migrate data from v1 (original) to v2 (PRD v3 with modes)
+const migrateData = (data) => {
+  const currentVersion = data.schemaVersion || 1;
+
+  if (currentVersion >= SCHEMA_VERSION) {
+    return data; // Already up to date
+  }
+
+  console.log(`Migrating data from schema v${currentVersion} to v${SCHEMA_VERSION}`);
+
+  // Migrate from v1 to v2
+  if (currentVersion < 2) {
+    data.projects = (data.projects || []).map(project => ({
+      ...project,
+      // Migrate categories to all-inclusive mode
+      categories: (project.categories || []).map(cat => ({
+        ...cat,
+        mode: 'all-inclusive',
+        totalBudget: cat.clientBudget ?? cat.totalBudget ?? 0,
+        totalCost: cat.yourCost ?? cat.totalCost ?? 0,
+        laborBudget: null,
+        laborCost: null,
+        materialsBudget: null,
+        // Migrate expenses to have null type (all-inclusive doesn't need type)
+        expenses: (cat.expenses || []).map(exp => ({
+          ...exp,
+          type: exp.type || null,
+          paymentMethod: exp.paymentMethod || null,
+          reference: exp.reference || null
+        })),
+        // Allocations: ensure amount field exists
+        allocations: (cat.allocations || []).map(alloc => ({
+          ...alloc,
+          amount: alloc.amount ?? 0,
+          laborAmount: alloc.laborAmount || null,
+          materialsAmount: alloc.materialsAmount || null
+        }))
+      })),
+      // Migrate payments
+      payments: (project.payments || []).map(pay => ({
+        ...pay,
+        paymentMethod: pay.paymentMethod || 'check',
+        reference: pay.reference || pay.checkNumber || '',
+        // Migrate payment allocations
+        allocations: (pay.allocations || []).map(alloc => ({
+          ...alloc,
+          amount: alloc.amount ?? 0,
+          laborAmount: alloc.laborAmount || null,
+          materialsAmount: alloc.materialsAmount || null
+        }))
+      }))
+    }));
+  }
+
+  data.schemaVersion = SCHEMA_VERSION;
+  return data;
+};
+
 // Database operations with localStorage fallback
 export const db = {
   async getProjects() {
@@ -35,10 +96,14 @@ export const db = {
       return data || [];
     }
 
-    // localStorage fallback
+    // localStorage fallback with migration
     const stored = localStorage.getItem('contractor-crm-data');
     if (stored) {
-      const data = JSON.parse(stored);
+      let data = JSON.parse(stored);
+      // Run migration if needed
+      data = migrateData(data);
+      // Save migrated data back
+      localStorage.setItem('contractor-crm-data', JSON.stringify(data));
       return data.projects || [];
     }
     return [];
@@ -162,14 +227,16 @@ export const db = {
         return null;
       }
 
-      // Save allocations
+      // Save allocations (supports both all-inclusive amount and separate labor/materials)
       if (allocations && allocations.length > 0) {
         const allocationsToSave = allocations
-          .filter(a => a.amount > 0)
+          .filter(a => (a.amount > 0) || (a.laborAmount > 0) || (a.materialsAmount > 0))
           .map(a => ({
             payment_id: savedPayment.id,
             category_id: a.categoryId,
-            amount: a.amount,
+            amount: a.amount || null,
+            labor_amount: a.laborAmount || null,
+            materials_amount: a.materialsAmount || null,
             date: payment.date
           }));
 
@@ -212,7 +279,12 @@ export const db = {
         .upsert({
           id: id || undefined,
           category_id: categoryId,
-          ...expenseData
+          amount: expenseData.amount,
+          date: expenseData.date,
+          description: expenseData.description,
+          type: expenseData.type || null,
+          payment_method: expenseData.paymentMethod || null,
+          reference: expenseData.reference || null
         })
         .select()
         .single();
